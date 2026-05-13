@@ -116,7 +116,10 @@ def connect_working_serial(port, preferred_baudrate, command):
                 return ser, baudrate, probe
             except Exception as ex:
                 last_error = ex
-                ser.close()
+                try:
+                    ser.close()
+                except Exception:
+                    pass
         except Exception as ex:
             last_error = ex
 

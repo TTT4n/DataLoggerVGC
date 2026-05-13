@@ -1,10 +1,13 @@
 import ctypes
 import queue
 import threading
+import time
 import tkinter as tk
 from collections import deque
 from pathlib import Path
 from tkinter import filedialog, ttk
+
+import serial
 
 from vgc50x.config import (
     APP_AUTHOR,
@@ -24,37 +27,67 @@ from vgc50x.config import (
 from vgc50x.session import LoggerSession
 from vgc50x.protocol import list_serial_port_names
 
+# ── Palette ──────────────────────────────────────────────────────────────────
+_BG         = "#f1f5f9"
+_SIDEBAR_BG = "#ffffff"
+_TOP_BG     = "#1e293b"
+_CARD_BG    = "#ffffff"
+_BORDER     = "#e2e8f0"
+_ACCENT     = "#0d9488"
+_ACCENT_ACT = "#0f766e"
+_DANGER     = "#ef4444"
+_TEXT       = "#0f172a"
+_TEXT2      = "#64748b"
+_CHART_BG   = "#f8fafc"
+_CHART_LINE = "#0d9488"
+_CHART_FILL = "#ccfbf1"
+_DOT_IDLE   = "#475569"
+_DOT_OK     = "#0d9488"
+_DOT_WARN   = "#f59e0b"
+_DOT_ERR    = "#ef4444"
+
+
+def _bordered(parent, **kw):
+    """tk.Frame with a 1-px border via highlightbackground."""
+    return tk.Frame(
+        parent,
+        bg=kw.pop("bg", _CARD_BG),
+        highlightbackground=kw.pop("highlightbackground", _BORDER),
+        highlightthickness=1,
+        **kw,
+    )
+
 
 class VGC50xLoggerApp:
-    ES_CONTINUOUS = 0x80000000
-    ES_SYSTEM_REQUIRED = 0x00000001
+    ES_CONTINUOUS       = 0x80000000
+    ES_SYSTEM_REQUIRED  = 0x00000001
     ES_DISPLAY_REQUIRED = 0x00000002
 
     def __init__(self, root):
         self.root = root
         self.root.title("VGC50x Data Logger")
-        self.root.geometry("1180x760")
-        self.root.minsize(980, 680)
-        self.root.configure(bg="#eef3f7")
+        self.root.geometry("1240x800")
+        self.root.minsize(980, 660)
+        self.root.configure(bg=_TOP_BG)
 
-        self.port_var = tk.StringVar(value=DEFAULT_COM_PORT)
-        self.baudrate_var = tk.StringVar(value=str(DEFAULT_BAUDRATE))
-        self.command_var = tk.StringVar(value=DEFAULT_CHANNEL_COMMAND)
-        self.interval_var = tk.StringVar(value=str(DEFAULT_INTERVAL_SEC))
-        self.rotate_hours_var = tk.StringVar(value=str(DEFAULT_ROTATE_HOURS))
-        self.csv_file_var = tk.StringVar(value=str(DEFAULT_CSV_FILE.resolve()))
+        self.port_var          = tk.StringVar(value=DEFAULT_COM_PORT)
+        self.baudrate_var      = tk.StringVar(value=str(DEFAULT_BAUDRATE))
+        self.command_var       = tk.StringVar(value=DEFAULT_CHANNEL_COMMAND)
+        self.interval_var      = tk.StringVar(value=str(DEFAULT_INTERVAL_SEC))
+        self.rotate_hours_var  = tk.StringVar(value=str(DEFAULT_ROTATE_HOURS))
+        self.csv_file_var      = tk.StringVar(value=str(DEFAULT_CSV_FILE.resolve()))
         self.prevent_sleep_var = tk.BooleanVar(value=DEFAULT_PREVENT_SLEEP)
 
-        self.connection_var = tk.StringVar(value="Idle")
-        self.last_update_var = tk.StringVar(value="-")
-        self.status_var = tk.StringVar(value="-")
-        self.status_meaning_var = tk.StringVar(value="-")
-        self.pressure_var = tk.StringVar(value="-")
+        self.connection_var      = tk.StringVar(value="Idle")
+        self.last_update_var     = tk.StringVar(value="—")
+        self.status_var          = tk.StringVar(value="—")
+        self.status_meaning_var  = tk.StringVar(value="—")
+        self.pressure_var        = tk.StringVar(value="—")
 
-        self.worker_thread = None
-        self.stop_event = threading.Event()
-        self.message_queue = queue.Queue()
-        self.samples = deque(maxlen=MAX_PLOT_POINTS)
+        self.worker_thread  = None
+        self.stop_event     = threading.Event()
+        self.message_queue  = queue.Queue()
+        self.samples        = deque(maxlen=MAX_PLOT_POINTS)
         self.logging_active = False
 
         self.style = ttk.Style()
@@ -66,159 +99,259 @@ class VGC50xLoggerApp:
         self.root.after(150, self.process_queue)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+    # ── Style configuration ───────────────────────────────────────────────────
+
     def _configure_styles(self):
-        self.style.configure("Root.TFrame", background="#eef3f7")
-        self.style.configure("Card.TFrame", background="#ffffff")
-        self.style.configure("Title.TLabel", background="#eef3f7", foreground="#17324d", font=("Segoe UI Semibold", 20))
-        self.style.configure("Muted.TLabel", background="#eef3f7", foreground="#5f7488", font=("Segoe UI", 10))
-        self.style.configure("CardTitle.TLabel", background="#ffffff", foreground="#17324d", font=("Segoe UI Semibold", 11))
-        self.style.configure("CardValue.TLabel", background="#ffffff", foreground="#12263a", font=("Consolas", 18, "bold"))
-        self.style.configure("Field.TLabel", background="#ffffff", foreground="#41576c", font=("Segoe UI", 10))
-        self.style.configure("Primary.TButton", font=("Segoe UI Semibold", 10))
+        self.style.configure("TCombobox", fieldbackground=_CARD_BG, background=_CARD_BG)
+        self.style.configure("TEntry", fieldbackground=_CARD_BG)
+        self.style.configure(
+            "Treeview",
+            background=_CARD_BG,
+            fieldbackground=_CARD_BG,
+            foreground=_TEXT,
+            rowheight=26,
+            font=("Segoe UI", 9),
+        )
+        self.style.configure(
+            "Treeview.Heading",
+            background=_BG,
+            foreground=_TEXT2,
+            font=("Segoe UI Semibold", 9),
+            relief="flat",
+        )
+        self.style.map("Treeview",
+            background=[("selected", _ACCENT)],
+            foreground=[("selected", "#ffffff")],
+        )
+        self.style.configure(
+            "TCheckbutton",
+            background=_SIDEBAR_BG,
+            foreground=_TEXT2,
+            font=("Segoe UI", 9),
+        )
+        self.style.map("TCheckbutton", background=[("active", _SIDEBAR_BG)])
+        self.style.configure("TSeparator", background=_BORDER)
+
+    # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
-        outer = ttk.Frame(self.root, style="Root.TFrame", padding=16)
-        outer.pack(fill="both", expand=True)
-        outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(1, weight=1)
-        outer.rowconfigure(2, weight=1)
+        self._build_topbar()
 
-        header = ttk.Frame(outer, style="Root.TFrame")
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        body = tk.Frame(self.root, bg=_BG)
+        body.pack(fill="both", expand=True)
 
-        ttk.Label(header, text="VGC50x Data Logger", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(
-            header,
-            text="Live pressure monitoring, CSV logging, and recent sample history.",
-            style="Muted.TLabel",
-        ).pack(anchor="w", pady=(2, 0))
-        ttk.Label(
-            header,
-            text=f"{APP_AUTHOR} | Version {APP_VERSION}",
-            style="Muted.TLabel",
-        ).pack(anchor="w", pady=(2, 0))
+        self._build_sidebar(body)
+        tk.Frame(body, bg=_BORDER, width=1).pack(side="left", fill="y")
+        self._build_main(body)
 
-        middle = ttk.Frame(outer, style="Root.TFrame")
-        middle.grid(row=1, column=0, sticky="nsew", pady=(0, 12))
-        middle.columnconfigure(0, weight=3)
-        middle.columnconfigure(1, weight=2)
-        middle.rowconfigure(0, weight=1)
+    def _build_topbar(self):
+        bar = tk.Frame(self.root, bg=_TOP_BG, height=52)
+        bar.pack(fill="x", side="top")
+        bar.pack_propagate(False)
 
-        chart_card = ttk.Frame(middle, style="Card.TFrame", padding=12)
-        chart_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        chart_card.columnconfigure(0, weight=1)
-        chart_card.rowconfigure(1, weight=1)
-        ttk.Label(chart_card, text="Live Trend", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
-        self.chart_canvas = tk.Canvas(chart_card, bg="#f8fbfd", highlightthickness=0, height=360)
-        self.chart_canvas.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
-        self.chart_canvas.bind("<Configure>", lambda _event: self.redraw_chart())
+        tk.Label(bar, text="VGC50x", bg=_TOP_BG, fg="#ffffff",
+                 font=("Segoe UI Semibold", 14)).pack(side="left", padx=(20, 4), pady=14)
+        tk.Label(bar, text="Data Logger", bg=_TOP_BG, fg="#94a3b8",
+                 font=("Segoe UI", 14)).pack(side="left")
 
-        controls = ttk.Frame(middle, style="Card.TFrame", padding=14)
-        controls.grid(row=0, column=1, sticky="nsew")
-        controls.columnconfigure(1, weight=1)
-        controls.columnconfigure(3, weight=1)
-        controls.rowconfigure(6, weight=1)
+        tk.Label(bar, text=APP_VERSION, bg=_TOP_BG, fg="#475569",
+                 font=("Segoe UI", 9)).pack(side="right", padx=(0, 20))
 
-        ttk.Label(controls, text="Connection", style="CardTitle.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        self._dot_canvas = tk.Canvas(bar, width=10, height=10, bg=_TOP_BG, highlightthickness=0)
+        self._dot_canvas.pack(side="right", padx=(0, 8))
+        self._dot = self._dot_canvas.create_oval(1, 1, 9, 9, fill=_DOT_IDLE, outline="")
 
-        actions = ttk.Frame(controls, style="Card.TFrame")
-        actions.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(0, 12))
-        actions.columnconfigure(3, weight=1)
+        tk.Label(bar, textvariable=self.connection_var, bg=_TOP_BG, fg="#94a3b8",
+                 font=("Segoe UI", 9)).pack(side="right", padx=(0, 6))
 
-        ttk.Button(actions, text="Refresh Ports", command=self.refresh_ports).grid(row=0, column=0, sticky="w")
-        self.start_button = ttk.Button(actions, text="Start Logging", command=self.start_logging, style="Primary.TButton")
-        self.start_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
-        self.stop_button = ttk.Button(actions, text="Stop", command=self.stop_logging, state="disabled")
-        self.stop_button.grid(row=0, column=2, sticky="w", padx=(8, 0))
-        ttk.Label(actions, textvariable=self.connection_var, style="Muted.TLabel", anchor="e").grid(
-            row=0, column=3, sticky="ew", padx=(12, 0)
-        )
+    def _build_sidebar(self, parent):
+        sidebar = tk.Frame(parent, bg=_SIDEBAR_BG, width=248)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
 
-        ttk.Label(controls, text="COM Port", style="Field.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.port_combo = ttk.Combobox(controls, textvariable=self.port_var, state="readonly", width=18)
-        self.port_combo.grid(row=2, column=1, sticky="ew", pady=4)
+        sb = tk.Frame(sidebar, bg=_SIDEBAR_BG, padx=18)
+        sb.pack(fill="both", expand=True, pady=18)
 
-        ttk.Label(controls, text="Baudrate", style="Field.TLabel").grid(row=2, column=2, sticky="w", padx=(16, 8), pady=4)
-        self.baud_combo = ttk.Combobox(
-            controls,
-            textvariable=self.baudrate_var,
-            state="readonly",
-            values=[str(rate) for rate in BAUDRATE_CANDIDATES],
-            width=12,
-        )
-        self.baud_combo.grid(row=2, column=3, sticky="ew", pady=4)
+        def section(title):
+            tk.Frame(sb, bg=_SIDEBAR_BG, height=6).pack()
+            tk.Label(sb, text=title, bg=_SIDEBAR_BG, fg=_TEXT,
+                     font=("Segoe UI Semibold", 10)).pack(anchor="w", pady=(0, 6))
 
-        ttk.Label(controls, text="Command", style="Field.TLabel").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.command_combo = ttk.Combobox(
-            controls,
-            textvariable=self.command_var,
-            state="readonly",
-            values=COMMAND_CHOICES,
-            width=10,
-        )
-        self.command_combo.grid(row=3, column=1, sticky="ew", pady=4)
+        def field(label, widget_factory):
+            tk.Label(sb, text=label.upper(), bg=_SIDEBAR_BG, fg=_TEXT2,
+                     font=("Segoe UI", 7, "bold")).pack(anchor="w", pady=(8, 2))
+            w = widget_factory(sb)
+            w.pack(fill="x")
+            return w
 
-        ttk.Label(controls, text="Record every (seconds)", style="Field.TLabel").grid(row=3, column=2, sticky="w", padx=(16, 8), pady=4)
-        self.interval_entry = ttk.Entry(controls, textvariable=self.interval_var)
-        self.interval_entry.grid(row=3, column=3, sticky="ew", pady=4)
+        def divider():
+            tk.Frame(sb, bg=_BORDER, height=1).pack(fill="x", pady=(14, 0))
 
-        ttk.Label(controls, text="New CSV every (hours)", style="Field.TLabel").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.rotate_entry = ttk.Entry(controls, textvariable=self.rotate_hours_var)
-        self.rotate_entry.grid(row=4, column=1, sticky="ew", pady=4)
-        ttk.Label(
-            controls,
-            text="Example: 2 = create a new CSV every 2 hours while logging",
-            style="Field.TLabel",
-        ).grid(row=4, column=2, columnspan=2, sticky="w", padx=(16, 0), pady=4)
+        # ── Connection ────────────────────────────────────────────
+        section("Connection")
 
-        ttk.Label(controls, text="CSV File", style="Field.TLabel").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.csv_entry = ttk.Entry(controls, textvariable=self.csv_file_var)
-        self.csv_entry.grid(row=5, column=1, columnspan=2, sticky="ew", pady=4)
+        self.port_combo = field("Port", lambda p: ttk.Combobox(
+            p, textvariable=self.port_var, state="readonly"))
 
-        self.browse_button = ttk.Button(controls, text="Browse", command=self.choose_csv_file)
-        self.browse_button.grid(row=5, column=3, sticky="ew", pady=4)
+        self.baud_combo = field("Baudrate", lambda p: ttk.Combobox(
+            p, textvariable=self.baudrate_var, state="readonly",
+            values=[str(r) for r in BAUDRATE_CANDIDATES]))
 
+        self.command_combo = field("Channel", lambda p: ttk.Combobox(
+            p, textvariable=self.command_var, state="readonly",
+            values=COMMAND_CHOICES))
+
+        divider()
+
+        # ── Logging ───────────────────────────────────────────────
+        section("Logging")
+
+        self.interval_entry = field("Interval (seconds)", lambda p: ttk.Entry(
+            p, textvariable=self.interval_var))
+
+        self.rotate_entry = field("New CSV every (hours)", lambda p: ttk.Entry(
+            p, textvariable=self.rotate_hours_var))
+
+        tk.Label(sb, text="CSV FILE", bg=_SIDEBAR_BG, fg=_TEXT2,
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w", pady=(8, 2))
+        csv_row = tk.Frame(sb, bg=_SIDEBAR_BG)
+        csv_row.pack(fill="x")
+        self.csv_entry = ttk.Entry(csv_row, textvariable=self.csv_file_var)
+        self.csv_entry.pack(side="left", fill="x", expand=True)
+        self.browse_button = ttk.Button(csv_row, text="…", width=3, command=self.choose_csv_file)
+        self.browse_button.pack(side="left", padx=(4, 0))
+
+        tk.Frame(sb, bg=_SIDEBAR_BG, height=8).pack()
         self.prevent_sleep_check = ttk.Checkbutton(
-            controls,
-            text="Keep notebook awake while app is open",
+            sb, text="Keep PC awake",
             variable=self.prevent_sleep_var,
             command=self.apply_sleep_prevention,
         )
-        self.prevent_sleep_check.grid(row=6, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self.prevent_sleep_check.pack(anchor="w")
 
-        status_panel = ttk.Frame(controls, style="Card.TFrame")
-        status_panel.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(12, 0))
-        status_panel.columnconfigure((0, 1), weight=1)
-        self._metric_card(status_panel, "Pressure", self.pressure_var).grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self._metric_card(status_panel, "Status", self.status_var).grid(row=0, column=1, sticky="ew", padx=(6, 0))
-        self._metric_card(status_panel, "Meaning", self.status_meaning_var).grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(8, 0))
-        self._metric_card(status_panel, "Last Update", self.last_update_var).grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(8, 0))
+        # ── Push buttons to bottom ────────────────────────────────
+        tk.Frame(sb, bg=_SIDEBAR_BG).pack(fill="both", expand=True)
 
-        log_card = ttk.Frame(outer, style="Card.TFrame", padding=12)
-        log_card.grid(row=2, column=0, sticky="nsew")
-        ttk.Label(log_card, text="Recent Samples", style="CardTitle.TLabel").pack(anchor="w")
+        divider()
+        tk.Frame(sb, bg=_SIDEBAR_BG, height=12).pack()
+
+        ttk.Button(sb, text="Refresh Ports", command=self.refresh_ports).pack(fill="x", pady=(0, 6))
+
+        self.start_button = tk.Button(
+            sb, text="▶   Start Logging",
+            command=self.start_logging,
+            bg=_ACCENT, fg="#ffffff",
+            activebackground=_ACCENT_ACT, activeforeground="#ffffff",
+            font=("Segoe UI Semibold", 10), relief="flat", bd=0,
+            pady=9, cursor="hand2",
+        )
+        self.start_button.pack(fill="x", pady=(0, 4))
+
+        self.stop_button = tk.Button(
+            sb, text="■   Stop",
+            command=self.stop_logging,
+            bg="#f1f5f9", fg=_TEXT2,
+            activebackground="#e2e8f0", activeforeground=_TEXT2,
+            font=("Segoe UI Semibold", 10), relief="flat", bd=0,
+            pady=9, cursor="hand2",
+            state="disabled",
+        )
+        self.stop_button.pack(fill="x")
+
+        tk.Label(sb, text=APP_AUTHOR, bg=_SIDEBAR_BG, fg=_TEXT2,
+                 font=("Segoe UI", 8)).pack(anchor="w", pady=(14, 0))
+
+    def _build_main(self, parent):
+        main = tk.Frame(parent, bg=_BG)
+        main.pack(side="left", fill="both", expand=True)
+
+        # ── Metrics row ───────────────────────────────────────────
+        metrics_row = tk.Frame(main, bg=_BG)
+        metrics_row.pack(fill="x", padx=18, pady=(18, 0))
+        metrics_row.columnconfigure((0, 1, 2), weight=1)
+
+        pressure_card = _bordered(metrics_row, bd=0)
+        pressure_card.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        tk.Label(pressure_card, text="PRESSURE (mbar)", bg=_CARD_BG, fg=_TEXT2,
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w", padx=16, pady=(14, 0))
+        tk.Label(pressure_card, textvariable=self.pressure_var, bg=_CARD_BG, fg=_TEXT,
+                 font=("Consolas", 26, "bold")).pack(anchor="w", padx=16, pady=(4, 14))
+
+        status_card = _bordered(metrics_row, bd=0)
+        status_card.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        tk.Label(status_card, text="STATUS CODE", bg=_CARD_BG, fg=_TEXT2,
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w", padx=16, pady=(14, 0))
+        tk.Label(status_card, textvariable=self.status_var, bg=_CARD_BG, fg=_TEXT,
+                 font=("Consolas", 26, "bold")).pack(anchor="w", padx=16, pady=(4, 14))
+
+        meaning_card = _bordered(metrics_row, bd=0)
+        meaning_card.grid(row=0, column=2, sticky="ew")
+        tk.Label(meaning_card, text="MEANING", bg=_CARD_BG, fg=_TEXT2,
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w", padx=16, pady=(14, 0))
+        tk.Label(meaning_card, textvariable=self.status_meaning_var, bg=_CARD_BG, fg=_TEXT,
+                 font=("Segoe UI Semibold", 18)).pack(anchor="w", padx=16, pady=(4, 14))
+
+        # ── Chart ─────────────────────────────────────────────────
+        chart_outer = tk.Frame(main, bg=_BG)
+        chart_outer.pack(fill="both", expand=True, padx=18, pady=(14, 0))
+
+        chart_card = _bordered(chart_outer, bd=0)
+        chart_card.pack(fill="both", expand=True)
+
+        chart_hdr = tk.Frame(chart_card, bg=_CARD_BG)
+        chart_hdr.pack(fill="x", padx=16, pady=(12, 0))
+        tk.Label(chart_hdr, text="Live Trend", bg=_CARD_BG, fg=_TEXT,
+                 font=("Segoe UI Semibold", 11)).pack(side="left")
+        tk.Label(chart_hdr, textvariable=self.last_update_var, bg=_CARD_BG, fg=_TEXT2,
+                 font=("Segoe UI", 9)).pack(side="right")
+
+        self.chart_canvas = tk.Canvas(chart_card, bg=_CHART_BG, highlightthickness=0)
+        self.chart_canvas.pack(fill="both", expand=True, padx=16, pady=(8, 14))
+        self.chart_canvas.bind("<Configure>", lambda _: self.redraw_chart())
+
+        # ── Table ─────────────────────────────────────────────────
+        table_outer = tk.Frame(main, bg=_BG)
+        table_outer.pack(fill="both", expand=False, padx=18, pady=(12, 18))
+
+        table_card = _bordered(table_outer, bd=0)
+        table_card.pack(fill="both", expand=True)
+
+        table_hdr = tk.Frame(table_card, bg=_CARD_BG)
+        table_hdr.pack(fill="x", padx=16, pady=(12, 0))
+        tk.Label(table_hdr, text="Recent Samples", bg=_CARD_BG, fg=_TEXT,
+                 font=("Segoe UI Semibold", 11)).pack(side="left")
+
+        tbl_frame = tk.Frame(table_card, bg=_CARD_BG)
+        tbl_frame.pack(fill="both", expand=True, padx=16, pady=(8, 14))
 
         columns = ("timestamp", "command", "status", "meaning", "pressure", "raw")
-        self.table = ttk.Treeview(log_card, columns=columns, show="headings", height=14)
-        self.table.pack(fill="both", expand=True, pady=(10, 0))
-        self.table.heading("timestamp", text="Timestamp")
-        self.table.heading("command", text="Command")
-        self.table.heading("status", text="Status")
-        self.table.heading("meaning", text="Meaning")
-        self.table.heading("pressure", text="Pressure")
-        self.table.heading("raw", text="Raw")
-        self.table.column("timestamp", width=160, anchor="w")
-        self.table.column("command", width=80, anchor="center")
-        self.table.column("status", width=70, anchor="center")
-        self.table.column("meaning", width=140, anchor="w")
-        self.table.column("pressure", width=100, anchor="e")
-        self.table.column("raw", width=220, anchor="w")
+        self.table = ttk.Treeview(tbl_frame, columns=columns, show="headings", height=7)
+        vsb = ttk.Scrollbar(tbl_frame, orient="vertical", command=self.table.yview)
+        self.table.configure(yscrollcommand=vsb.set)
+        self.table.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
 
-    def _metric_card(self, parent, title, variable):
-        frame = ttk.Frame(parent, style="Card.TFrame", padding=12)
-        ttk.Label(frame, text=title, style="CardTitle.TLabel").pack(anchor="w")
-        ttk.Label(frame, textvariable=variable, style="CardValue.TLabel").pack(anchor="w", pady=(8, 0))
-        return frame
+        self.table.heading("timestamp", text="Timestamp")
+        self.table.heading("command",   text="Channel")
+        self.table.heading("status",    text="Status")
+        self.table.heading("meaning",   text="Meaning")
+        self.table.heading("pressure",  text="Pressure")
+        self.table.heading("raw",       text="Raw Response")
+
+        self.table.column("timestamp", width=155, anchor="w",      stretch=False)
+        self.table.column("command",   width=70,  anchor="center", stretch=False)
+        self.table.column("status",    width=65,  anchor="center", stretch=False)
+        self.table.column("meaning",   width=130, anchor="w",      stretch=False)
+        self.table.column("pressure",  width=115, anchor="e",      stretch=False)
+        self.table.column("raw",       width=200, anchor="w")
+
+        self.table.tag_configure("odd",  background=_CARD_BG)
+        self.table.tag_configure("even", background=_BG)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _set_dot(self, color):
+        self._dot_canvas.itemconfig(self._dot, fill=color)
 
     def refresh_ports(self):
         ports = list_serial_port_names()
@@ -246,8 +379,8 @@ class VGC50xLoggerApp:
             self.csv_file_var.set(selected)
 
     def set_settings_enabled(self, enabled):
-        combo_state = "readonly" if enabled else "disabled"
-        widget_state = "normal" if enabled else "disabled"
+        combo_state  = "readonly" if enabled else "disabled"
+        widget_state = "normal"   if enabled else "disabled"
 
         self.port_combo.configure(state=combo_state)
         self.baud_combo.configure(state=combo_state)
@@ -258,15 +391,23 @@ class VGC50xLoggerApp:
         self.browse_button.configure(state=widget_state)
         self.prevent_sleep_check.configure(state=widget_state)
 
+        if enabled:
+            self.start_button.configure(state="normal",   bg=_ACCENT,   fg="#ffffff")
+            self.stop_button.configure( state="disabled", bg="#f1f5f9",  fg=_TEXT2)
+        else:
+            self.start_button.configure(state="disabled", bg="#94a3b8",  fg="#ffffff")
+            self.stop_button.configure( state="normal",   bg="#fee2e2",  fg=_DANGER,
+                                        activebackground="#fecaca", activeforeground=_DANGER)
+
     def apply_sleep_prevention(self):
         if not hasattr(ctypes, "windll"):
             return
-
         flags = self.ES_CONTINUOUS
         if self.prevent_sleep_var.get():
             flags |= self.ES_SYSTEM_REQUIRED | self.ES_DISPLAY_REQUIRED
-
         ctypes.windll.kernel32.SetThreadExecutionState(flags)
+
+    # ── Logging control ───────────────────────────────────────────────────────
 
     def start_logging(self):
         if self.logging_active:
@@ -294,31 +435,33 @@ class VGC50xLoggerApp:
             self.connection_var.set("Invalid baudrate selected.")
             return
 
-        port = self.port_var.get().strip()
-        command = self.command_var.get().strip().upper()
+        port     = self.port_var.get().strip()
+        command  = self.command_var.get().strip().upper()
         csv_file = Path(self.csv_file_var.get()).expanduser()
 
         if not port:
             self.connection_var.set("Choose a COM port before starting.")
             return
 
+        if not csv_file.parent.exists():
+            self.connection_var.set(f"CSV directory does not exist: {csv_file.parent}")
+            return
+
         self.stop_event.clear()
         self.logging_active = True
         self.set_settings_enabled(False)
-        self.start_button.configure(state="disabled")
-        self.stop_button.configure(state="normal")
-        self.connection_var.set(f"Connecting to {port}...")
+        self._set_dot(_DOT_WARN)
+        self.connection_var.set(f"Connecting to {port}…")
 
-        worker_args = (port, preferred_baudrate, command, interval, rotate_hours, csv_file)
-        self.worker_thread = threading.Thread(target=self.logging_worker, args=worker_args, daemon=True)
+        args = (port, preferred_baudrate, command, interval, rotate_hours, csv_file)
+        self.worker_thread = threading.Thread(target=self.logging_worker, args=args, daemon=True)
         self.worker_thread.start()
 
     def stop_logging(self):
         if not self.logging_active:
             return
-
         self.stop_event.set()
-        self.connection_var.set("Stopping logger...")
+        self.connection_var.set("Stopping logger…")
         self.stop_button.configure(state="disabled")
 
     def logging_worker(self, port, preferred_baudrate, command, interval, rotate_hours, csv_file):
@@ -328,13 +471,21 @@ class VGC50xLoggerApp:
             self.message_queue.put({"type": "connected", **details})
 
             while not self.stop_event.is_set():
+                cycle_start = time.monotonic()
                 try:
                     sample = session.read_sample()
                     self.message_queue.put({"type": "sample", **sample})
+                except serial.SerialException as ex:
+                    raise RuntimeError(f"Serial port lost: {ex}") from ex
                 except Exception as ex:
                     self.message_queue.put({"type": "error", "message": str(ex)})
+                    if self.stop_event.wait(2.0):
+                        break
+                    continue
 
-                if self.stop_event.wait(interval):
+                elapsed   = time.monotonic() - cycle_start
+                remaining = max(0.0, interval - elapsed)
+                if self.stop_event.wait(remaining):
                     break
         except Exception as ex:
             self.message_queue.put({"type": "fatal", "message": str(ex)})
@@ -342,39 +493,45 @@ class VGC50xLoggerApp:
             session.close()
             self.message_queue.put({"type": "stopped"})
 
+    # ── Queue processing ──────────────────────────────────────────────────────
+
     def process_queue(self):
         while True:
             try:
-                message = self.message_queue.get_nowait()
+                msg = self.message_queue.get_nowait()
             except queue.Empty:
                 break
 
-            message_type = message["type"]
+            t = msg["type"]
 
-            if message_type == "connected":
-                self.csv_file_var.set(message["csv_path"])
+            if t == "connected":
+                self.csv_file_var.set(msg["csv_path"])
+                self._set_dot(_DOT_OK)
                 self.connection_var.set(
-                    f"Connected to {message['port']} at {message['baudrate']} baud | Logging to {Path(message['csv_path']).name}"
+                    f"Connected · {msg['port']} · {msg['baudrate']} baud · {Path(msg['csv_path']).name}"
                 )
-            elif message_type == "sample":
-                self.handle_sample(message)
-            elif message_type == "error":
-                self.connection_var.set(f"Read error: {message['message']}")
-            elif message_type == "fatal":
-                self.connection_var.set(f"Connection failed: {message['message']}")
-            elif message_type == "stopped":
+            elif t == "sample":
+                self.handle_sample(msg)
+            elif t == "error":
+                self._set_dot(_DOT_WARN)
+                self.connection_var.set(f"Read error: {msg['message']}")
+            elif t == "fatal":
+                self._set_dot(_DOT_ERR)
+                self.connection_var.set(f"Connection failed: {msg['message']}")
+            elif t == "stopped":
                 self.logging_active = False
                 self.set_settings_enabled(True)
-                self.start_button.configure(state="normal")
-                self.stop_button.configure(state="disabled")
+                self._set_dot(_DOT_IDLE)
                 if not self.connection_var.get().startswith("Connection failed"):
                     self.connection_var.set("Logger stopped")
 
         self.root.after(150, self.process_queue)
 
+    # ── Sample handling ───────────────────────────────────────────────────────
+
     def handle_sample(self, sample):
         pressure = sample["pressure"]
-        pressure_display = "-" if pressure is None else f"{pressure:.6g}"
+        pressure_display = "—" if pressure is None else f"{pressure:.6g}"
         rotation = sample.get("rotated")
 
         self.pressure_var.set(pressure_display)
@@ -384,13 +541,12 @@ class VGC50xLoggerApp:
 
         if rotation:
             self.csv_file_var.set(rotation["csv_path"])
-            self.connection_var.set(
-                f"Rotated log file | New CSV: {Path(rotation['csv_path']).name}"
-            )
+            self.connection_var.set(f"Log rotated · {Path(rotation['csv_path']).name}")
 
+        row_count = len(self.table.get_children())
+        tag = "even" if row_count % 2 == 0 else "odd"
         self.table.insert(
-            "",
-            0,
+            "", 0,
             values=(
                 sample["timestamp"],
                 sample["command"],
@@ -399,6 +555,7 @@ class VGC50xLoggerApp:
                 pressure_display,
                 sample["raw"],
             ),
+            tags=(tag,),
         )
 
         rows = self.table.get_children()
@@ -409,63 +566,74 @@ class VGC50xLoggerApp:
             self.samples.append((sample["timestamp"], pressure))
             self.redraw_chart()
 
+    # ── Chart ─────────────────────────────────────────────────────────────────
+
     def redraw_chart(self):
         canvas = self.chart_canvas
         canvas.delete("all")
 
-        width = canvas.winfo_width()
-        height = canvas.winfo_height()
-        if width < 20 or height < 20:
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w < 20 or h < 20:
             return
 
-        pad_left = 48
-        pad_right = 16
-        pad_top = 18
-        pad_bottom = 28
-        plot_width = width - pad_left - pad_right
-        plot_height = height - pad_top - pad_bottom
-
-        canvas.create_rectangle(pad_left, pad_top, width - pad_right, height - pad_bottom, outline="#d7e1ea")
+        pl, pr, pt, pb = 56, 16, 14, 30
+        pw = w - pl - pr
+        ph = h - pt - pb
 
         if len(self.samples) < 2:
             canvas.create_text(
-                width / 2,
-                height / 2,
-                text="Start logging to see the pressure trend",
-                fill="#6d7f90",
-                font=("Segoe UI", 12),
+                w / 2, h / 2,
+                text="Start logging to see the live pressure trend",
+                fill=_TEXT2, font=("Segoe UI", 11),
             )
             return
 
-        values = [value for _, value in self.samples]
-        min_value = min(values)
-        max_value = max(values)
-        if min_value == max_value:
-            min_value -= 1
-            max_value += 1
+        values   = [v for _, v in self.samples]
+        min_val  = min(values)
+        max_val  = max(values)
+        if min_val == max_val:
+            min_val -= 1
+            max_val += 1
+        val_span = max_val - min_val
 
+        # Grid lines + Y labels
         for step in range(5):
-            y = pad_top + (plot_height * step / 4)
-            canvas.create_line(pad_left, y, width - pad_right, y, fill="#edf2f6")
-            value = max_value - ((max_value - min_value) * step / 4)
-            canvas.create_text(pad_left - 8, y, text=f"{value:.3g}", fill="#607385", font=("Segoe UI", 9), anchor="e")
+            y     = pt + ph * step / 4
+            val   = max_val - val_span * step / 4
+            canvas.create_line(pl, y, w - pr, y, fill="#e2e8f0", dash=(4, 4))
+            canvas.create_text(pl - 6, y, text=f"{val:.3g}", fill=_TEXT2,
+                               font=("Segoe UI", 8), anchor="e")
 
-        points = []
-        span = len(values) - 1
-        for index, value in enumerate(values):
-            x = pad_left + (plot_width * index / span)
-            y_ratio = (value - min_value) / (max_value - min_value)
-            y = pad_top + plot_height - (plot_height * y_ratio)
-            points.extend([x, y])
+        # Build point coords
+        span   = len(values) - 1
+        pts    = []
+        for i, v in enumerate(values):
+            x = pl + pw * i / span
+            y = pt + ph - ph * (v - min_val) / val_span
+            pts.extend([x, y])
 
-        canvas.create_line(points, fill="#0f7c82", width=2.5, smooth=True)
-        last_x, last_y = points[-2], points[-1]
-        canvas.create_oval(last_x - 4, last_y - 4, last_x + 4, last_y + 4, fill="#0f7c82", outline="")
+        # Fill polygon (line + baseline)
+        fill_poly = list(pts) + [pts[-2], pt + ph, pl, pt + ph]
+        canvas.create_polygon(fill_poly, fill=_CHART_FILL, outline="", smooth=True)
 
-        first_label = self.samples[0][0][-8:]
-        last_label = self.samples[-1][0][-8:]
-        canvas.create_text(pad_left, height - 10, text=first_label, fill="#607385", font=("Segoe UI", 9), anchor="w")
-        canvas.create_text(width - pad_right, height - 10, text=last_label, fill="#607385", font=("Segoe UI", 9), anchor="e")
+        # Line
+        canvas.create_line(pts, fill=_CHART_LINE, width=2, smooth=True)
+
+        # Latest-point dot
+        lx, ly = pts[-2], pts[-1]
+        canvas.create_oval(lx - 5, ly - 5, lx + 5, ly + 5,
+                           fill=_CHART_LINE, outline=_CARD_BG, width=2)
+
+        # X-axis time labels
+        first = self.samples[0][0][-8:]
+        last  = self.samples[-1][0][-8:]
+        canvas.create_text(pl,     h - 10, text=first, fill=_TEXT2,
+                           font=("Segoe UI", 8), anchor="w")
+        canvas.create_text(w - pr, h - 10, text=last,  fill=_TEXT2,
+                           font=("Segoe UI", 8), anchor="e")
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def on_close(self):
         self.stop_event.set()

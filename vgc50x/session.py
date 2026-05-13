@@ -4,23 +4,7 @@ from pathlib import Path
 
 from vgc50x.protocol import connect_working_serial, parse_pressure_response, read_pressure, status_meaning
 
-
-def ensure_csv_header(csv_path):
-    if csv_path.exists() and csv_path.stat().st_size > 0:
-        return
-
-    with csv_path.open(mode="a", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(
-            [
-                "Timestamp",
-                "Command",
-                "Status",
-                "StatusMeaning",
-                "Pressure",
-                "RawResponse",
-            ]
-        )
+_CSV_HEADER = ["Timestamp", "Command", "Status", "StatusMeaning", "Pressure", "RawResponse"]
 
 
 def build_session_csv_path(base_path):
@@ -49,9 +33,12 @@ class LoggerSession:
 
     def _open_csv_file(self):
         self.csv_path = build_session_csv_path(self.base_csv_path)
-        ensure_csv_header(self.csv_path)
+        is_new = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
         self._csv_handle = self.csv_path.open(mode="a", newline="", encoding="utf-8")
         self._writer = csv.writer(self._csv_handle)
+        if is_new:
+            self._writer.writerow(_CSV_HEADER)
+            self._csv_handle.flush()
         self._opened_at = datetime.now()
         self._rotate_after = self._opened_at + timedelta(hours=self.rotate_hours)
 
@@ -92,9 +79,9 @@ class LoggerSession:
 
     def read_sample(self):
         rotation = self._rotate_csv_if_needed()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         raw = read_pressure(self.serial_connection, self.command)
         data = parse_pressure_response(raw)
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         meaning = status_meaning(data["status"])
 
         sample = {

@@ -77,6 +77,13 @@ The logger uses the VGC50x request / response flow:
 3. Send `ENQ`
 4. Read the ASCII pressure response
 
+Official reference:
+
+- INFICON Operating Manual, `Section 5 Communication Protocol (Serial Interface)`, starting on page 67
+- `5.1 Data Transmission` starts on page 68
+- `5.2 Communication Protocol` starts on page 69
+- Manual PDF: https://www.inficon.com/media/4375/download/Operating-manual-VGC50x.pdf?v=3&inline=true&language=es
+
 ## Troubleshooting
 
 - If no data appears, confirm the correct COM port in Device Manager.
